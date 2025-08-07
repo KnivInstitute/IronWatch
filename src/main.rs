@@ -1,23 +1,116 @@
-mod cli;
 mod usb_monitor;
 mod config;
-mod output;
 
-use cli::{build_cli, parse_args, print_banner, CliConfig};
-use usb_monitor::{UsbMonitor, UsbDeviceChange};
-use config::ConfigManager;
-use output::OutputManager;
+#[cfg(feature = "gui")]
+mod gui_simple;
+
+#[cfg(feature = "cli")]
+mod cli;
+#[cfg(feature = "cli")]
+mod output;
 
 use anyhow::{Result, Context};
 use env_logger;
 use log::{info, error, debug, warn};
-use tokio;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::signal;
+
+#[cfg(feature = "gui")]
+use eframe::egui;
+
+#[cfg(feature = "cli")]
+use {
+    cli::{build_cli, parse_args, print_banner, CliConfig},
+    usb_monitor::{UsbMonitor, UsbDeviceChange},
+    config::ConfigManager,
+    output::OutputManager,
+    std::sync::Arc,
+    tokio::sync::Mutex,
+    tokio::signal,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize logging
+    init_logging("info")?;
+
+    #[cfg(feature = "gui")]
+    {
+        // Launch GUI application
+        launch_gui().await
+    }
+
+    #[cfg(all(feature = "cli", not(feature = "gui")))]
+    {
+        // Launch CLI application
+        launch_cli().await
+    }
+
+    #[cfg(not(any(feature = "gui", feature = "cli")))]
+    {
+        eprintln!("No interface enabled. Please enable either 'gui' or 'cli' feature.");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(feature = "gui")]
+async fn launch_gui() -> Result<()> {
+    info!("Starting IronWatch GUI...");
+    
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_min_inner_size([800.0, 600.0])
+            .with_icon(load_icon())
+            .with_title("IronWatch - USB Device Monitor"),
+        centered: true,
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Dark,
+        run_and_return: false,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "IronWatch",
+        options,
+        Box::new(|cc| Box::new(gui_simple::IronWatchGui::new(cc))),
+    ).map_err(|e| anyhow::anyhow!("Failed to run GUI: {}", e))
+}
+
+#[cfg(feature = "gui")]
+fn load_icon() -> egui::IconData {
+    // let icon_data = include_bytes!("../assets/icon.png"); // Uncomment for actual icon file
+    
+    // For now, create a simple colored square as fallback
+    let (icon_rgba, icon_width, icon_height) = {
+        let size = 32;
+        let mut rgba = Vec::with_capacity(size * size * 4);
+        
+        for y in 0..size {
+            for x in 0..size {
+                let is_border = x == 0 || y == 0 || x == size - 1 || y == size - 1;
+                let is_inner = (x > 8 && x < size - 8) && (y > 8 && y < size - 8);
+                
+                if is_border {
+                    rgba.extend_from_slice(&[100, 150, 255, 255]); // Blue border
+                } else if is_inner {
+                    rgba.extend_from_slice(&[150, 200, 255, 255]); // Light blue center
+                } else {
+                    rgba.extend_from_slice(&[50, 100, 200, 255]); // Dark blue
+                }
+            }
+        }
+        
+        (rgba, size as u32, size as u32)
+    };
+
+    egui::IconData {
+        rgba: icon_rgba,
+        width: icon_width,
+        height: icon_height,
+    }
+}
+
+#[cfg(feature = "cli")]
+async fn launch_cli() -> Result<()> {
     // Parse command line arguments
     let matches = build_cli().get_matches();
     let cli_config = parse_args(&matches)?;
@@ -77,8 +170,14 @@ fn init_logging(log_level: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run USB device monitoring mode
+#[cfg(feature = "cli")]
 async fn run_monitoring_mode(cli_config: CliConfig, config_manager: ConfigManager) -> Result<()> {
+    use usb_monitor::{UsbMonitor, UsbDeviceChange};
+    use config::ConfigManager;
+    use output::OutputManager;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio::signal;
     info!("Starting USB device monitoring mode");
 
     // Create USB monitor
@@ -156,8 +255,11 @@ async fn run_monitoring_mode(cli_config: CliConfig, config_manager: ConfigManage
     Ok(())
 }
 
-/// Run device listing mode
+#[cfg(feature = "cli")]
 async fn run_list_mode(cli_config: CliConfig, config_manager: ConfigManager) -> Result<()> {
+    use usb_monitor::UsbMonitor;
+    use config::ConfigManager;
+    use output::OutputManager;
     info!("Listing USB devices");
 
     // Create USB monitor
@@ -184,11 +286,12 @@ async fn run_list_mode(cli_config: CliConfig, config_manager: ConfigManager) -> 
     Ok(())
 }
 
-/// Run configuration management mode
+#[cfg(feature = "cli")]
 async fn run_config_mode(
     matches: &clap::ArgMatches,
     mut config_manager: ConfigManager,
 ) -> Result<()> {
+    use config::ConfigManager;
     match matches.subcommand() {
         Some(("show", _)) => {
             // Display current configuration

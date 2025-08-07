@@ -11,7 +11,18 @@ keywords = ["usb", "monitoring", "security", "device", "input"]
 categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
+# GUI Framework
+eframe = "0.27"
+egui = "0.27"
+egui_extras = { version = "0.27", features = ["default"] }
+egui_plot = "0.27"
+
+# System Integration
+notify-rust = "4.10"
+tray-icon = "0.14"
+winit = "0.29"
+
+# Async and Utilities
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -20,5 +31,17 @@ env_logger = "0.10"
 anyhow = "1.0"
 rusb = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
-crossterm = "0.27"
 dirs = "5.0"
+
+# Animation and Visual Effects
+# easing = "0.0.5"  # Using simpler animation approach
+palette = "0.7"
+
+# Optional CLI support (for debugging/advanced users)
+clap = { version = "4.4", features = ["derive"], optional = true }
+crossterm = { version = "0.27", optional = true }
+
+[features]
+default = ["gui"]
+gui = []
+cli = ["clap", "crossterm"]

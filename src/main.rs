@@ -1,8 +1,13 @@
 mod usb_monitor;
 mod config;
+mod error;
+mod communication;
+mod monitoring_service;
 
 #[cfg(feature = "gui")]
 mod gui_simple;
+#[cfg(feature = "gui")]
+mod system_tray;
 
 #[cfg(feature = "cli")]
 mod cli;
@@ -12,6 +17,9 @@ mod output;
 use anyhow::{Result, Context};
 use env_logger;
 use log::{info, error, debug, warn};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::signal;
 
 #[cfg(feature = "gui")]
 use eframe::egui;
@@ -31,29 +39,60 @@ use {
 async fn main() -> Result<()> {
     // Initialize logging
     init_logging("info")?;
+    
+    // Setup graceful shutdown
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_clone = shutdown_flag.clone();
+    
+    // Handle Ctrl+C gracefully
+    tokio::spawn(async move {
+        if let Err(e) = signal::ctrl_c().await {
+            error!("Failed to listen for shutdown signal: {}", e);
+            return;
+        }
+        info!("Shutdown signal received, initiating graceful shutdown...");
+        shutdown_flag_clone.store(true, Ordering::Relaxed);
+    });
 
-    #[cfg(feature = "gui")]
-    {
-        // Launch GUI application
-        launch_gui().await
-    }
+    let result = {
+        #[cfg(feature = "gui")]
+        {
+            // Launch GUI application
+            launch_gui_with_shutdown(shutdown_flag.clone()).await
+        }
 
-    #[cfg(all(feature = "cli", not(feature = "gui")))]
-    {
-        // Launch CLI application
-        launch_cli().await
-    }
+        #[cfg(all(feature = "cli", not(feature = "gui")))]
+        {
+            // Launch CLI application
+            launch_cli_with_shutdown(shutdown_flag.clone()).await
+        }
 
-    #[cfg(not(any(feature = "gui", feature = "cli")))]
-    {
-        eprintln!("No interface enabled. Please enable either 'gui' or 'cli' feature.");
-        std::process::exit(1);
-    }
+        #[cfg(not(any(feature = "gui", feature = "cli")))]
+        {
+            eprintln!("No interface enabled. Please enable either 'gui' or 'cli' feature.");
+            std::process::exit(1);
+        }
+    };
+    
+    // Cleanup
+    info!("Application shutting down...");
+    result
 }
 
 #[cfg(feature = "gui")]
-async fn launch_gui() -> Result<()> {
+async fn launch_gui_with_shutdown(shutdown_flag: Arc<AtomicBool>) -> Result<()> {
+    use communication::CommunicationHub;
+    use monitoring_service::start_monitoring_service_with_recovery;
+    
     info!("Starting IronWatch GUI...");
+    
+    // Create communication hub
+    let (communication_hub, communication_receiver) = CommunicationHub::new();
+    
+    // Start monitoring service in background
+    let monitoring_handle = start_monitoring_service_with_recovery(communication_receiver, 3)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start monitoring service: {}", e))?;
     
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -68,11 +107,23 @@ async fn launch_gui() -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    // Store communication hub for shutdown
+    let communication_hub_shutdown = communication_hub.clone();
+    
+    let result = eframe::run_native(
         "IronWatch",
         options,
-        Box::new(|cc| Box::new(gui_simple::IronWatchGui::new(cc))),
-    ).map_err(|e| anyhow::anyhow!("Failed to run GUI: {}", e))
+        Box::new(move |cc| Box::new(gui_simple::IronWatchGui::new(cc, communication_hub))),
+    ).map_err(|e| anyhow::anyhow!("Failed to run GUI: {}", e));
+    
+    // GUI has closed, shutdown the monitoring service
+    info!("GUI closed, shutting down monitoring service...");
+    let _ = communication_hub_shutdown.shutdown();
+    
+    // Wait for monitoring service to finish
+    let _ = monitoring_handle.await;
+    
+    result
 }
 
 #[cfg(feature = "gui")]
@@ -110,7 +161,7 @@ fn load_icon() -> egui::IconData {
 }
 
 #[cfg(feature = "cli")]
-async fn launch_cli() -> Result<()> {
+async fn launch_cli_with_shutdown(shutdown_flag: Arc<AtomicBool>) -> Result<()> {
     // Parse command line arguments
     let matches = build_cli().get_matches();
     let cli_config = parse_args(&matches)?;
@@ -129,10 +180,10 @@ async fn launch_cli() -> Result<()> {
     config_manager.validate()
         .context("Configuration validation failed")?;
 
-    // Handle subcommands
+    // Handle subcommands with shutdown support
     match matches.subcommand() {
         Some(("monitor", _)) => {
-            run_monitoring_mode(cli_config, config_manager).await?;
+            run_monitoring_mode_with_shutdown(cli_config, config_manager, shutdown_flag).await?;
         }
         Some(("list", _)) => {
             run_list_mode(cli_config, config_manager).await?;
@@ -171,7 +222,7 @@ fn init_logging(log_level: &str) -> Result<()> {
 }
 
 #[cfg(feature = "cli")]
-async fn run_monitoring_mode(cli_config: CliConfig, config_manager: ConfigManager) -> Result<()> {
+async fn run_monitoring_mode_with_shutdown(cli_config: CliConfig, config_manager: ConfigManager, shutdown_flag: Arc<AtomicBool>) -> Result<()> {
     use usb_monitor::{UsbMonitor, UsbDeviceChange};
     use config::ConfigManager;
     use output::OutputManager;
@@ -226,7 +277,7 @@ async fn run_monitoring_mode(cli_config: CliConfig, config_manager: ConfigManage
             }).await
         });
 
-        // Handle Ctrl+C gracefully
+        // Handle Ctrl+C gracefully and check shutdown flag
         tokio::select! {
             result = monitoring_task => {
                 match result {
@@ -237,7 +288,13 @@ async fn run_monitoring_mode(cli_config: CliConfig, config_manager: ConfigManage
             }
             _ = signal::ctrl_c() => {
                 info!("Received interrupt signal, shutting down gracefully...");
+                shutdown_flag.store(true, Ordering::Relaxed);
             }
+        }
+        
+        // Wait a bit for cleanup
+        while !shutdown_flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     } else {
         // Single scan mode

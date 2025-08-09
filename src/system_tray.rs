@@ -57,26 +57,34 @@ impl SystemTray {
             .with_icon(Self::create_tray_icon())
             .build()?;
         
+        // Store menu item IDs for comparison
+        let show_id = show_item.id().clone();
+        let hide_id = hide_item.id().clone();
+        let monitoring_id = monitoring_item.id().clone();
+        let settings_id = settings_item.id().clone();
+        let about_id = about_item.id().clone();
+        let quit_id = quit_item.id().clone();
+        
         // Handle menu events
         let sender_clone = sender.clone();
-        MenuEvent::set_event_handler(Some(move |event| {
+        MenuEvent::set_event_handler(Some(move |event: tray_icon::menu::MenuEvent| {
             match event.id {
-                id if id == show_item.id() => {
+                id if id == show_id => {
                     let _ = sender_clone.send(TrayMessage::Show);
                 }
-                id if id == hide_item.id() => {
+                id if id == hide_id => {
                     let _ = sender_clone.send(TrayMessage::Hide);
                 }
-                id if id == monitoring_item.id() => {
+                id if id == monitoring_id => {
                     let _ = sender_clone.send(TrayMessage::ToggleMonitoring);
                 }
-                id if id == settings_item.id() => {
+                id if id == settings_id => {
                     let _ = sender_clone.send(TrayMessage::ShowSettings);
                 }
-                id if id == about_item.id() => {
+                id if id == about_id => {
                     let _ = sender_clone.send(TrayMessage::ShowAbout);
                 }
-                id if id == quit_item.id() => {
+                id if id == quit_id => {
                     let _ = sender_clone.send(TrayMessage::Quit);
                 }
                 _ => {}
@@ -89,9 +97,6 @@ impl SystemTray {
             match event {
                 TrayIconEvent::Click { .. } => {
                     let _ = sender_clone.send(TrayMessage::Show);
-                }
-                TrayIconEvent::DoubleClick { .. } => {
-                    let _ = sender_clone.send(TrayMessage::ToggleMonitoring);
                 }
                 _ => {}
             }

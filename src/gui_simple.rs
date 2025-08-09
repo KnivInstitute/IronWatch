@@ -1,17 +1,18 @@
-use crate::usb_monitor::{UsbMonitor, UsbDeviceInfo};
+use crate::usb_monitor::UsbDeviceInfo;
+use crate::communication::{CommunicationHub, MonitorEvent, MonitoringStatus};
+use crate::error::{Result, get_user_friendly_message};
 
 use eframe::egui::{self, *};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct IronWatchGui {
     // Core state
     devices: Vec<UsbDeviceInfo>,
-    usb_monitor: Arc<Mutex<Option<UsbMonitor>>>,
+    communication_hub: CommunicationHub,
+    monitoring_status: MonitoringStatus,
     
     // UI state
     current_tab: Tab,
-    monitoring_active: bool,
     
     // Animation state
     last_refresh: Instant,
@@ -23,6 +24,11 @@ pub struct IronWatchGui {
     show_settings: bool,
     dark_mode: bool,
     show_animations: bool,
+    
+    // Error handling
+    last_error: Option<String>,
+    error_message: Option<String>,
+    show_permission_dialog: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -35,55 +41,88 @@ pub enum Tab {
 
 impl Default for IronWatchGui {
     fn default() -> Self {
-        Self {
-            devices: Vec::new(),
-            usb_monitor: Arc::new(Mutex::new(None)),
-            current_tab: Tab::Dashboard,
-            monitoring_active: false,
-            last_refresh: Instant::now(),
-            search_filter: String::new(),
-            show_settings: false,
-            dark_mode: true,
-            show_animations: true,
-        }
+        // This should not be used directly, use new() instead
+        panic!("Use IronWatchGui::new() instead of Default::default()")
     }
 }
 
 impl IronWatchGui {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, communication_hub: CommunicationHub) -> Self {
         // Configure style
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals.dark_mode = true;
         style.visuals.window_rounding = Rounding::same(10.0);
         cc.egui_ctx.set_style(style);
         
-        let mut app = Self::default();
-        app.initialize_usb_monitoring();
+        let app = Self {
+            devices: Vec::new(),
+            communication_hub,
+            monitoring_status: MonitoringStatus::Stopped,
+            current_tab: Tab::Dashboard,
+            last_refresh: Instant::now(),
+            search_filter: String::new(),
+            show_settings: false,
+            dark_mode: true,
+            show_animations: true,
+            last_error: None,
+            error_message: None,
+            show_permission_dialog: false,
+        };
+        
+        // Start initial device refresh
+        let _ = app.communication_hub.refresh_devices();
         app
     }
     
-    fn initialize_usb_monitoring(&mut self) {
-        match UsbMonitor::new() {
-            Ok(monitor) => {
-                *self.usb_monitor.lock().unwrap() = Some(monitor);
-                log::info!("USB monitoring initialized");
-            }
-            Err(e) => {
-                log::error!("Failed to initialize USB monitoring: {}", e);
+    fn process_monitoring_events(&mut self) {
+        // Process events from the monitoring service
+        while let Some(event) = self.communication_hub.try_recv_event() {
+            match event {
+                MonitorEvent::DevicesLoaded(devices) | MonitorEvent::DevicesUpdated(devices) => {
+                    self.devices = devices;
+                }
+                MonitorEvent::DeviceChanged(change) => {
+                    log::info!("Device change: {:?}", change);
+                    // Refresh device list after change
+                    let _ = self.communication_hub.refresh_devices();
+                }
+                MonitorEvent::DevicesChanged(changes) => {
+                    log::info!("Multiple device changes: {} devices", changes.len());
+                    // Refresh device list after changes
+                    let _ = self.communication_hub.refresh_devices();
+                }
+                MonitorEvent::MonitoringStarted => {
+                    self.monitoring_status = MonitoringStatus::Running;
+                }
+                MonitorEvent::MonitoringStopped => {
+                    self.monitoring_status = MonitoringStatus::Stopped;
+                }
+                MonitorEvent::MonitoringError(error) => {
+                    self.monitoring_status = MonitoringStatus::Error(error.clone());
+                    self.error_message = Some(error);
+                }
+                MonitorEvent::PermissionError(error) => {
+                    self.monitoring_status = MonitoringStatus::Error(format!("Permission: {}", error));
+                    self.error_message = Some(error);
+                    self.show_permission_dialog = true;
+                }
+                MonitorEvent::UsbUnavailable(error) => {
+                    self.monitoring_status = MonitoringStatus::Error(format!("USB Unavailable: {}", error));
+                    self.error_message = Some(error);
+                }
             }
         }
     }
     
-    fn refresh_devices(&mut self) {
-        if let Some(ref mut monitor) = *self.usb_monitor.lock().unwrap() {
-            match monitor.get_connected_devices() {
-                Ok(devices) => {
-                    self.devices = devices;
-                }
-                Err(e) => {
-                    log::error!("Error getting devices: {}", e);
-                }
-            }
+    fn is_monitoring_active(&self) -> bool {
+        matches!(self.monitoring_status, MonitoringStatus::Running)
+    }
+    
+    fn toggle_monitoring(&mut self) {
+        if self.is_monitoring_active() {
+            let _ = self.communication_hub.stop_monitoring();
+        } else {
+            let _ = self.communication_hub.start_monitoring();
         }
     }
     
@@ -96,7 +135,7 @@ impl IronWatchGui {
                 ui.label("v1.0.0 GUI");
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.monitoring_active {
+                    if self.is_monitoring_active() {
                         ui.colored_label(Color32::GREEN, "● MONITORING");
                     } else {
                         ui.colored_label(Color32::GRAY, "● IDLE");
@@ -139,7 +178,7 @@ impl IronWatchGui {
         ui.horizontal(|ui| {
             self.render_stat_card(ui, "Connected Devices", &self.devices.len().to_string(), Color32::BLUE);
             ui.add_space(20.0);
-            self.render_stat_card(ui, "Monitoring Status", if self.monitoring_active { "Active" } else { "Inactive" }, if self.monitoring_active { Color32::GREEN } else { Color32::GRAY });
+            self.render_stat_card(ui, "Monitoring Status", if self.is_monitoring_active() { "Active" } else { "Inactive" }, if self.is_monitoring_active() { Color32::GREEN } else { Color32::GRAY });
         });
         
         ui.add_space(30.0);
@@ -150,19 +189,19 @@ impl IronWatchGui {
         
         ui.horizontal(|ui| {
             if ui.button("🔄 Refresh Devices").clicked() {
-                self.refresh_devices();
+                let _ = self.communication_hub.refresh_devices();
             }
             
             ui.add_space(10.0);
             
-            let monitor_text = if self.monitoring_active {
+            let monitor_text = if self.is_monitoring_active() {
                 "⏸️ Stop Monitoring"
             } else {
                 "▶️ Start Monitoring"
             };
             
             if ui.button(monitor_text).clicked() {
-                self.monitoring_active = !self.monitoring_active;
+                self.toggle_monitoring();
             }
         });
         
@@ -201,7 +240,7 @@ impl IronWatchGui {
             
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("🔄 Refresh").clicked() {
-                    self.refresh_devices();
+                    let _ = self.communication_hub.refresh_devices();
                 }
             });
         });
@@ -263,20 +302,20 @@ impl IronWatchGui {
         
         // Controls
         ui.horizontal(|ui| {
-            let button_text = if self.monitoring_active {
+            let button_text = if self.is_monitoring_active() {
                 "⏸️ Stop Monitoring"
             } else {
                 "▶️ Start Monitoring"
             };
             
             if ui.button(button_text).clicked() {
-                self.monitoring_active = !self.monitoring_active;
+                self.toggle_monitoring();
             }
             
             ui.separator();
             
             ui.label("Status:");
-            if self.monitoring_active {
+            if self.is_monitoring_active() {
                 ui.colored_label(Color32::GREEN, "● ACTIVE");
             } else {
                 ui.colored_label(Color32::GRAY, "● INACTIVE");
@@ -285,7 +324,7 @@ impl IronWatchGui {
         
         ui.add_space(30.0);
         
-        if self.monitoring_active {
+        if self.is_monitoring_active() {
             ui.label("🔍 Monitoring for USB device changes...");
             ui.add_space(10.0);
             ui.label("Connect or disconnect USB devices to see real-time updates.");
@@ -296,8 +335,8 @@ impl IronWatchGui {
         ui.add_space(20.0);
         
         // Auto-refresh when monitoring
-        if self.monitoring_active && self.last_refresh.elapsed().as_secs() >= 2 {
-            self.refresh_devices();
+        if self.is_monitoring_active() && self.last_refresh.elapsed().as_secs() >= 2 {
+            let _ = self.communication_hub.refresh_devices();
             self.last_refresh = Instant::now();
         }
         
@@ -355,15 +394,47 @@ impl IronWatchGui {
 
 impl eframe::App for IronWatchGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process monitoring events
+        self.process_monitoring_events();
+        
         // Auto-refresh devices periodically
         if self.last_refresh.elapsed().as_secs() >= 5 {
-            self.refresh_devices();
+            let _ = self.communication_hub.refresh_devices();
             self.last_refresh = Instant::now();
         }
         
         // Render UI
         self.render_top_panel(ctx);
         self.render_main_content(ctx);
+        
+        // Show error dialogs if needed
+        if let Some(error) = &self.error_message.clone() {
+            egui::Window::new("Error")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(error);
+                    if ui.button("OK").clicked() {
+                        self.error_message = None;
+                    }
+                });
+        }
+        
+        // Show permission dialog if needed
+        if self.show_permission_dialog {
+            egui::Window::new("Permission Required")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("USB access requires elevated permissions.");
+                    ui.add_space(10.0);
+                    ui.label("Please run the application as administrator or check device permissions.");
+                    ui.add_space(10.0);
+                    if ui.button("OK").clicked() {
+                        self.show_permission_dialog = false;
+                    }
+                });
+        }
         
         // Request repaint for animations
         if self.show_animations {

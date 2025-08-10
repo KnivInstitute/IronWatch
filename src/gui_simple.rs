@@ -1,6 +1,7 @@
 use crate::usb_monitor::UsbDeviceInfo;
 use crate::communication::{CommunicationHub, MonitorEvent, MonitoringStatus};
 use crate::error::{Result, get_user_friendly_message};
+use crate::system_tray::{SystemTray, TrayMessage};
 
 use eframe::egui::{self, *};
 use std::time::Instant;
@@ -10,6 +11,10 @@ pub struct IronWatchGui {
     devices: Vec<UsbDeviceInfo>,
     communication_hub: CommunicationHub,
     monitoring_status: MonitoringStatus,
+    
+    // System tray
+    system_tray: Option<SystemTray>,
+    tray_sender: Option<std::sync::mpsc::Sender<TrayMessage>>,
     
     // UI state
     current_tab: Tab,
@@ -41,23 +46,34 @@ pub enum Tab {
 
 impl Default for IronWatchGui {
     fn default() -> Self {
-        // This should not be used directly, use new() instead
         panic!("Use IronWatchGui::new() instead of Default::default()")
     }
 }
 
 impl IronWatchGui {
     pub fn new(cc: &eframe::CreationContext<'_>, communication_hub: CommunicationHub) -> Self {
-        // Configure style
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals.dark_mode = true;
         style.visuals.window_rounding = Rounding::same(10.0);
         cc.egui_ctx.set_style(style);
         
+        let (system_tray, tray_sender) = match SystemTray::new() {
+            Ok((tray, sender)) => {
+                log::info!("System tray initialized successfully");
+                (Some(tray), Some(sender))
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize system tray: {}", e);
+                (None, None)
+            }
+        };
+        
         let app = Self {
             devices: Vec::new(),
             communication_hub,
             monitoring_status: MonitoringStatus::Stopped,
+            system_tray,
+            tray_sender,
             current_tab: Tab::Dashboard,
             last_refresh: Instant::now(),
             search_filter: String::new(),
@@ -69,13 +85,11 @@ impl IronWatchGui {
             show_permission_dialog: false,
         };
         
-        // Start initial device refresh
         let _ = app.communication_hub.refresh_devices();
         app
     }
     
     fn process_monitoring_events(&mut self) {
-        // Process events from the monitoring service
         while let Some(event) = self.communication_hub.try_recv_event() {
             match event {
                 MonitorEvent::DevicesLoaded(devices) | MonitorEvent::DevicesUpdated(devices) => {
@@ -83,32 +97,75 @@ impl IronWatchGui {
                 }
                 MonitorEvent::DeviceChanged(change) => {
                     log::info!("Device change: {:?}", change);
+                    // Show notification
+                    let title = "USB Device Change";
+                    let device_info = change.get_device_info();
+                    let product_name = device_info.product.as_deref().unwrap_or("Unknown Device");
+                    let message = format!("Device {} detected", product_name);
+                    self.show_tray_notification(title, &message);
                     // Refresh device list after change
                     let _ = self.communication_hub.refresh_devices();
                 }
                 MonitorEvent::DevicesChanged(changes) => {
                     log::info!("Multiple device changes: {} devices", changes.len());
+                    let title = "USB Devices Changed";
+                    let message = format!("{} devices changed", changes.len());
+                    self.show_tray_notification(title, &message);
                     // Refresh device list after changes
                     let _ = self.communication_hub.refresh_devices();
                 }
                 MonitorEvent::MonitoringStarted => {
                     self.monitoring_status = MonitoringStatus::Running;
+                    self.update_tray_icon();
                 }
                 MonitorEvent::MonitoringStopped => {
                     self.monitoring_status = MonitoringStatus::Stopped;
+                    self.update_tray_icon();
                 }
                 MonitorEvent::MonitoringError(error) => {
-                    self.monitoring_status = MonitoringStatus::Error(error.clone());
-                    self.error_message = Some(error);
+                    self.last_error = Some(error);
                 }
                 MonitorEvent::PermissionError(error) => {
-                    self.monitoring_status = MonitoringStatus::Error(format!("Permission: {}", error));
-                    self.error_message = Some(error);
+                    self.last_error = Some(format!("Permission error: {}", error));
                     self.show_permission_dialog = true;
                 }
                 MonitorEvent::UsbUnavailable(error) => {
-                    self.monitoring_status = MonitoringStatus::Error(format!("USB Unavailable: {}", error));
-                    self.error_message = Some(error);
+                    self.last_error = Some(format!("USB unavailable: {}", error));
+                }
+            }
+        }
+    }
+    
+    fn process_tray_messages(&mut self) {
+        if let Some(tray) = &self.system_tray {
+            let mut messages = Vec::new();
+            
+            while let Some(message) = tray.try_recv() {
+                messages.push(message);
+            }
+            
+            for message in messages {
+                match message {
+                    TrayMessage::Show => {
+                        log::info!("Show window requested from system tray");
+                    }
+                    TrayMessage::Hide => {
+                        log::info!("Hide window requested from system tray");
+                    }
+                    TrayMessage::ToggleMonitoring => {
+                        self.toggle_monitoring();
+                    }
+                    TrayMessage::ShowSettings => {
+                        self.show_settings = true;
+                        self.current_tab = Tab::Settings;
+                    }
+                    TrayMessage::ShowAbout => {
+                        log::info!("About requested from system tray");
+                    }
+                    TrayMessage::Quit => {
+                        log::info!("Quit requested from system tray");
+                        std::process::exit(0);
+                    }
                 }
             }
         }
@@ -123,6 +180,26 @@ impl IronWatchGui {
             let _ = self.communication_hub.stop_monitoring();
         } else {
             let _ = self.communication_hub.start_monitoring();
+        }
+        
+        // Update tray icon
+        self.update_tray_icon();
+    }
+    
+    fn update_tray_icon(&mut self) {
+        if let Some(tray) = &self.system_tray {
+            let is_monitoring = self.is_monitoring_active();
+            if let Err(e) = tray.update_icon(is_monitoring) {
+                log::warn!("Failed to update tray icon: {}", e);
+            }
+        }
+    }
+    
+    fn show_tray_notification(&self, title: &str, message: &str) {
+        if let Some(tray) = &self.system_tray {
+            if let Err(e) = tray.show_notification(title, message) {
+                log::warn!("Failed to show tray notification: {}", e);
+            }
         }
     }
     
@@ -334,7 +411,6 @@ impl IronWatchGui {
         
         ui.add_space(20.0);
         
-        // Auto-refresh when monitoring
         if self.is_monitoring_active() && self.last_refresh.elapsed().as_secs() >= 2 {
             let _ = self.communication_hub.refresh_devices();
             self.last_refresh = Instant::now();
@@ -352,6 +428,40 @@ impl IronWatchGui {
         
         ui.checkbox(&mut self.dark_mode, "Dark Mode");
         ui.checkbox(&mut self.show_animations, "Enable Animations");
+        
+        ui.add_space(20.0);
+        
+        ui.heading("System Integration");
+        ui.add_space(10.0);
+        
+        let mut tray_enabled = self.system_tray.is_some();
+        if ui.checkbox(&mut tray_enabled, "Enable System Tray").clicked() {
+            if tray_enabled && self.system_tray.is_none() {
+                // Try to create system tray
+                match SystemTray::new() {
+                    Ok((tray, sender)) => {
+                        self.system_tray = Some(tray);
+                        self.tray_sender = Some(sender);
+                        log::info!("System tray enabled");
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to enable system tray: {}", e);
+                        self.last_error = Some(format!("Failed to enable system tray: {}", e));
+                    }
+                }
+            } else if !tray_enabled && self.system_tray.is_some() {
+                // Disable system tray
+                self.system_tray = None;
+                self.tray_sender = None;
+                log::info!("System tray disabled");
+            }
+        }
+        
+        if tray_enabled {
+            ui.label("System tray is active and will show notifications for USB changes");
+        } else {
+            ui.label("System tray is disabled");
+        }
         
         ui.add_space(20.0);
         
@@ -397,6 +507,9 @@ impl eframe::App for IronWatchGui {
         // Process monitoring events
         self.process_monitoring_events();
         
+        // Process tray messages
+        self.process_tray_messages();
+        
         // Auto-refresh devices periodically
         if self.last_refresh.elapsed().as_secs() >= 5 {
             let _ = self.communication_hub.refresh_devices();
@@ -440,5 +553,22 @@ impl eframe::App for IronWatchGui {
         if self.show_animations {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+    
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Clean up system tray on exit
+        if self.system_tray.is_some() {
+            log::info!("Cleaning up system tray on exit");
+        }
+    }
+    
+    fn auto_save_interval(&self) -> std::time::Duration {
+        // Auto-save every 30 seconds
+        std::time::Duration::from_secs(30)
+    }
+    
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Use dark theme background color
+        [0.1, 0.1, 0.1, 1.0]
     }
 }

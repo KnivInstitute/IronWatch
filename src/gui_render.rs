@@ -9,12 +9,10 @@ impl IronWatchGui {
             ui.add_space(4.0);
             
             ui.horizontal(|ui| {
-                // Logo and title
                 ui.heading("🛡️ IronWatch");
                 ui.label("v1.0.0");
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Status indicators
                     if self.monitoring_active {
                         let pulse_color = Color32::from_rgb(
                             (255.0 * self.pulse_animation) as u8,
@@ -27,13 +25,10 @@ impl IronWatchGui {
                     }
                     
                     ui.separator();
-                    
-                    // Device count
                     ui.label(format!("📱 {} devices", self.devices.len()));
                     
                     ui.separator();
                     
-                    // FPS counter (debug)
                     if ui.small_button("🔧").clicked() {
                         self.show_settings = true;
                     }

@@ -1,4 +1,4 @@
-use crate::usb_monitor::{UsbDeviceInfo, UsbDeviceChange};
+use crate::usb_monitor::{UsbDeviceInfo, UsbDeviceChange, DeviceStatistics, DeviceAnalytics, SecurityEvent};
 use crate::cli::OutputFormat;
 use serde_json;
 use std::fs::OpenOptions;
@@ -71,6 +71,276 @@ impl OutputManager {
         if let Some(ref mut file) = self.output_file {
             file.flush().context("Failed to flush output file")?;
         }
+        
+        Ok(())
+    }
+
+    /// Export device history to a file
+    pub fn export_device_history(
+        &mut self,
+        devices: &[UsbDeviceInfo],
+        device_stats: &[(String, DeviceStatistics)],
+        analytics: &DeviceAnalytics,
+        security_events: &[SecurityEvent],
+        export_path: &PathBuf,
+    ) -> Result<()> {
+        let timestamp = Utc::now();
+        
+        match self.format {
+            OutputFormat::Json => self.export_json_history(devices, device_stats, analytics, security_events, export_path, timestamp),
+            OutputFormat::Table => self.export_table_history(devices, device_stats, analytics, security_events, export_path, timestamp),
+            OutputFormat::Csv => self.export_csv_history(devices, device_stats, analytics, security_events, export_path, timestamp),
+        }
+    }
+
+    /// Export device history in JSON format
+    fn export_json_history(
+        &mut self,
+        devices: &[UsbDeviceInfo],
+        device_stats: &[(String, DeviceStatistics)],
+        analytics: &DeviceAnalytics,
+        security_events: &[SecurityEvent],
+        export_path: &PathBuf,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let export_data = serde_json::json!({
+            "export_timestamp": timestamp,
+            "export_format": "json",
+            "summary": {
+                "total_devices": devices.len(),
+                "total_connections": analytics.connection_frequency.iter().map(|(_, count)| count).sum::<u32>(),
+                "unique_devices": analytics.unique_devices,
+                "blocked_devices": analytics.blocked_devices,
+                "security_violations": analytics.security_violations,
+                "device_classes": analytics.device_class_distribution.len(),
+                "vendors": analytics.vendor_distribution.len(),
+            },
+            "current_devices": devices,
+            "device_statistics": device_stats,
+            "analytics": {
+                "device_class_distribution": analytics.device_class_distribution,
+                "vendor_distribution": analytics.vendor_distribution,
+                "connection_frequency": analytics.connection_frequency,
+            },
+            "security": {
+                "total_blocked": analytics.blocked_devices,
+                "total_violations": analytics.security_violations,
+                "security_events": security_events,
+            }
+        });
+
+        let json_string = serde_json::to_string_pretty(&export_data)
+            .context("Failed to serialize export data to JSON")?;
+        
+        std::fs::write(export_path, json_string)
+            .with_context(|| format!("Failed to write export file: {}", export_path.display()))?;
+        
+        Ok(())
+    }
+
+    /// Export device history in CSV format
+    fn export_csv_history(
+        &mut self,
+        devices: &[UsbDeviceInfo],
+        device_stats: &[(String, DeviceStatistics)],
+        analytics: &DeviceAnalytics,
+        security_events: &[SecurityEvent],
+        export_path: &PathBuf,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let mut csv_content = String::new();
+        
+        // Header
+        csv_content.push_str("Export Timestamp,Device Count,Total Connections,Unique Devices,Blocked Devices,Security Violations\n");
+        csv_content.push_str(&format!("{},{},{},{},{},{}\n", 
+            timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+            devices.len(),
+            analytics.connection_frequency.iter().map(|(_, count)| count).sum::<u32>(),
+            analytics.unique_devices,
+            analytics.blocked_devices,
+            analytics.security_violations
+        ));
+        
+        csv_content.push_str("\nCurrent Devices\n");
+        csv_content.push_str("Bus,Vendor ID,Product ID,Manufacturer,Product,Serial,Class,Status,Timestamp\n");
+        
+        for device in devices {
+            csv_content.push_str(&format!("{},{:04x},{:04x},{},{},{},{:02x},{:?},{}\n",
+                device.bus_number,
+                device.vendor_id,
+                device.product_id,
+                device.manufacturer.as_deref().unwrap_or("Unknown"),
+                device.product.as_deref().unwrap_or("Unknown"),
+                device.serial_number.as_deref().unwrap_or("Unknown"),
+                device.device_class,
+                device.connection_status,
+                device.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+            ));
+        }
+        
+        csv_content.push_str("\nDevice Statistics\n");
+        csv_content.push_str("Device Key,Total Connections,Total Disconnections,Total Blocked,First Seen,Last Seen,Connection Duration,Current Count\n");
+        
+        for (key, stats) in device_stats {
+            csv_content.push_str(&format!("{},{},{},{},{},{},{},{}\n",
+                key,
+                stats.total_connections,
+                stats.total_disconnections,
+                stats.total_blocked,
+                stats.first_seen.format("%Y-%m-%d %H:%M:%S UTC"),
+                stats.last_seen.format("%Y-%m-%d %H:%M:%S UTC"),
+                stats.connection_duration.as_secs(),
+                stats.connection_count
+            ));
+        }
+        
+        csv_content.push_str("\nSecurity Events\n");
+        csv_content.push_str("Timestamp,Event Type,Device Product,Vendor ID,Product ID,Reason,Action\n");
+        
+        for event in security_events {
+            csv_content.push_str(&format!("{},{:?},{},{:04x},{:04x},{},{:?}\n",
+                event.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+                event.event_type,
+                event.device_info.product.as_deref().unwrap_or("Unknown"),
+                event.device_info.vendor_id,
+                event.device_info.product_id,
+                event.reason,
+                event.action_taken
+            ));
+        }
+        
+        csv_content.push_str("\nDevice Class Distribution\n");
+        csv_content.push_str("Class ID,Count\n");
+        
+        for (class_id, count) in &analytics.device_class_distribution {
+            csv_content.push_str(&format!("0x{:02x},{}\n", class_id, count));
+        }
+        
+        csv_content.push_str("\nVendor Distribution\n");
+        csv_content.push_str("Vendor ID,Count\n");
+        
+        for (vendor_id, count) in &analytics.vendor_distribution {
+            csv_content.push_str(&format!("0x{:04x},{}\n", vendor_id, count));
+        }
+        
+        csv_content.push_str("\nConnection Frequency (24h)\n");
+        csv_content.push_str("Hour,Connections\n");
+        
+        for (timestamp, count) in &analytics.connection_frequency {
+            csv_content.push_str(&format!("{},{}\n", 
+                timestamp.format("%H:00"), 
+                count
+            ));
+        }
+        
+        std::fs::write(export_path, csv_content)
+            .with_context(|| format!("Failed to write export file: {}", export_path.display()))?;
+        
+        Ok(())
+    }
+
+    /// Export device history in table format (human-readable)
+    fn export_table_history(
+        &mut self,
+        devices: &[UsbDeviceInfo],
+        device_stats: &[(String, DeviceStatistics)],
+        analytics: &DeviceAnalytics,
+        security_events: &[SecurityEvent],
+        export_path: &PathBuf,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let mut table_content = String::new();
+        
+        // Header
+        table_content.push_str("IronWatch Device History Export\n");
+        table_content.push_str("================================\n\n");
+        table_content.push_str(&format!("Export Time: {}\n", timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
+        table_content.push_str(&format!("Total Devices: {}\n", devices.len()));
+        table_content.push_str(&format!("Total Connections (24h): {}\n", 
+            analytics.connection_frequency.iter().map(|(_, count)| count).sum::<u32>()));
+        table_content.push_str(&format!("Unique Devices: {}\n", analytics.unique_devices));
+        table_content.push_str(&format!("Blocked Devices: {}\n", analytics.blocked_devices));
+        table_content.push_str(&format!("Security Violations: {}\n", analytics.security_violations));
+        table_content.push_str(&format!("Device Classes: {}\n", analytics.device_class_distribution.len()));
+        table_content.push_str(&format!("Vendors: {}\n", analytics.vendor_distribution.len()));
+        table_content.push_str("\n");
+        
+        // Current Devices
+        table_content.push_str("CURRENT DEVICES\n");
+        table_content.push_str("===============\n");
+        table_content.push_str("Bus  Vendor ID  Product ID  Manufacturer          Product               Class  Status\n");
+        table_content.push_str("---- ---------- ----------- -------------------- -------------------- ------ --------\n");
+        
+        for device in devices {
+            table_content.push_str(&format!("{:3}  {:04x}       {:04x}      {:<20} {:<20} {:02x}    {:?}\n",
+                device.bus_number,
+                device.vendor_id,
+                device.product_id,
+                device.manufacturer.as_deref().unwrap_or("Unknown").chars().take(20).collect::<String>(),
+                device.product.as_deref().unwrap_or("Unknown").chars().take(20).collect::<String>(),
+                device.device_class,
+                device.connection_status
+            ));
+        }
+        
+        table_content.push_str("\nDEVICE STATISTICS\n");
+        table_content.push_str("=================\n");
+        table_content.push_str("Device Key                    Connections  Disconnections  Blocked  First Seen           Last Seen            Duration\n");
+        table_content.push_str("---------------------------- ------------ --------------- -------- -------------------- -------------------- ---------\n");
+        
+        for (key, stats) in device_stats {
+            let key_short = if key.len() > 28 { format!("{}...", &key[..25]) } else { key.clone() };
+            table_content.push_str(&format!("{:<28} {:>12} {:>15} {:>8} {:>19} {:>19} {:>9}s\n",
+                key_short,
+                stats.total_connections,
+                stats.total_disconnections,
+                stats.total_blocked,
+                stats.first_seen.format("%Y-%m-%d %H:%M"),
+                stats.last_seen.format("%Y-%m-%d %H:%M"),
+                stats.connection_duration.as_secs()
+            ));
+        }
+        
+        // Security Events
+        table_content.push_str("\nSECURITY EVENTS\n");
+        table_content.push_str("===============\n");
+        table_content.push_str("Timestamp           Event Type      Device Product        Vendor ID  Product ID  Reason                    Action\n");
+        table_content.push_str("------------------- --------------- -------------------- ---------- ----------- ------------------------- --------\n");
+        
+        for event in security_events {
+            table_content.push_str(&format!("{}  {:<14} {:<20} {:04x}      {:04x}      {:<25} {:?}\n",
+                event.timestamp.format("%Y-%m-%d %H:%M"),
+                format!("{:?}", event.event_type),
+                event.device_info.product.as_deref().unwrap_or("Unknown").chars().take(20).collect::<String>(),
+                event.device_info.vendor_id,
+                event.device_info.product_id,
+                event.reason.chars().take(25).collect::<String>(),
+                event.action_taken
+            ));
+        }
+        
+        // Analytics summary
+        table_content.push_str("\nANALYTICS SUMMARY\n");
+        table_content.push_str("=================\n");
+        
+        if !analytics.device_class_distribution.is_empty() {
+            table_content.push_str("Device Class Distribution:\n");
+            for (class_id, count) in &analytics.device_class_distribution {
+                table_content.push_str(&format!("  0x{:02x}: {}\n", class_id, count));
+            }
+            table_content.push_str("\n");
+        }
+        
+        if !analytics.vendor_distribution.is_empty() {
+            table_content.push_str("Vendor Distribution:\n");
+            for (vendor_id, count) in &analytics.vendor_distribution {
+                table_content.push_str(&format!("  0x{:04x}: {}\n", vendor_id, count));
+            }
+            table_content.push_str("\n");
+        }
+        
+        std::fs::write(export_path, table_content)
+            .with_context(|| format!("Failed to write export file: {}", export_path.display()))?;
         
         Ok(())
     }
